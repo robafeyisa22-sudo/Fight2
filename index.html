@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <title>Ninja Fighter</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' data: blob: filesystem:; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com;">
+</head>
+
+<body> 
+    <div class="flex gap-3.5 items-start flex-wrap w-full max-w-[1040px] justify-center">
+        <div class="flex flex-col gap-2 items-center">
+            <div class="text-[13px] text-[#b8c4e8]">Player 1</div>
+            <canvas id="animCanvas" width="1" height="1" class="" style="image-rendering: pixelated;"></canvas>
+            <div class="flex items-center gap-2 text-xs text-[#b8c4e8]">
+                <label for="p1Scale">Size</label>
+                <input id="p1Scale" type="range" min="60" max="200" value="60" step="5" class="w-40 accent-[#3c7bff]" />
+                <span id="p1ScaleVal">60%</span>
+            </div>
+            <div id="p1Buttons" class="grid grid-cols-3 gap-1.5 mt-1.5"></div>
+        </div>
+        <div class="flex flex-col gap-2 items-center">
+            <div class="text-[13px] text-[#b8c4e8]">Player 2</div>
+            <canvas id="animCanvasBW" width="1" height="1" class="" style="image-rendering: pixelated;"></canvas>
+            <div class="flex items-center gap-2 text-xs text-[#b8c4e8]">
+                <label for="p2Scale">Size</label>
+                <input id="p2Scale" type="range" min="60" max="200" value="60" step="5" class="w-40 accent-[#3c7bff]" />
+                <span id="p2ScaleVal">60%</span>
+            </div>
+            <div id="p2Buttons" class="grid grid-cols-3 gap-1.5 mt-1.5"></div>
+        </div>
+    </div>
+
+    <div class="text-[#aeb9db] text-sm text-center min-h-[1.2em]" id="status">Choose an animation.</div>
+    <div class="text-[#92a2cf] text-xs text-center">Loads frames from <code>animation.json</code> and images from <code>assets/</code> with matching
+        names.</div>
+
+    <script>
+        // Tailwind body-level styles
+        document.body.className = "m-0 font-sans bg-[#0a0d14] text-[#e9eeff] flex flex-col items-center gap-3.5 p-4";
+
+        const canvas = document.getElementById("animCanvas");
+        const ctx = canvas.getContext("2d");
+        const canvasBW = document.getElementById("animCanvasBW");
+        const ctxBW = canvasBW.getContext("2d");
+        const statusEl = document.getElementById("status");
+        const p1Buttons = document.getElementById("p1Buttons");
+        const p2Buttons = document.getElementById("p2Buttons");
+        const p1ScaleInput = document.getElementById("p1Scale");
+        const p2ScaleInput = document.getElementById("p2Scale");
+        const p1ScaleVal = document.getElementById("p1ScaleVal");
+        const p2ScaleVal = document.getElementById("p2ScaleVal");
+
+        /** Player states (independent) */
+        const stateColor = {
+            type: "color",
+            canvas,
+            ctx,
+            spriteImage: null,
+            frames: [],
+            frameIndex: 0,
+            currentAnim: "",
+            loopEnabled: true,
+            flip: "right",
+            scale: 0.6
+        };
+        const stateRed = {
+            type: "red",
+            canvas: canvasBW,
+            ctx: ctxBW,
+            spriteImage: null,
+            frames: [],
+            frameIndex: 0,
+            currentAnim: "",
+            loopEnabled: true,
+            flip: "left",
+            scale: 0.6
+        };
+
+        let timer = null;
+        let playing = true;
+        // Loaded once from animation.json: { [lowerName]: normalizedFrames[] }
+        let animationsByName = null;
+        let animationsLoaded = false;
+        // Optional loop defaults per animation name: { [lowerName]: boolean }
+        let animationLoopByName = null;
+        // 'right' (default) or 'left' per preview (stored in state)
+
+        // no global animation buttons; per-character buttons are rendered under each canvas
+
+        // loop is driven by animation.json; no UI toggle; fixed FPS
+
+        // flip buttons exist per character row (buttons 6 and 7), wired in buildCharacterButtons()
+
+        // no separate effect selector; second view is always red-tinted
+
+        function clampInt(value, min, max, fallback) {
+            const n = parseInt(value, 10);
+            if (!Number.isFinite(n)) return fallback;
+            return Math.max(min, Math.min(max, n));
+        }
+
+        function setStatus(text) {
+            statusEl.textContent = text;
+        }
+
+        function stopTimer() {
+            if (timer) {
+                clearInterval(timer);
+                timer = null;
+            }
+        }
+
+        function startTimer() {
+            stopTimer();
+            const fps = 8; // fixed default FPS
+            timer = setInterval(() => {
+                stepPlayer(stateColor);
+                stepPlayer(stateRed);
+                drawAll();
+            }, Math.round(1000 / fps));
+        }
+
+        function updateCanvasSize(state) {
+            if (!state.frames || state.frames.length === 0) return;
+            const maxW = Math.max(...state.frames.map(fr => fr.width));
+            const maxH = Math.max(...state.frames.map(fr => fr.height));
+            const scaledW = Math.max(1, Math.round(maxW * state.scale));
+            const scaledH = Math.max(1, Math.round(maxH * state.scale));
+            if (state.canvas.width !== scaledW || state.canvas.height !== scaledH) {
+                state.canvas.width = scaledW;
+                state.canvas.height = scaledH;
+                state.ctx.imageSmoothingEnabled = false;
+            }
+        }
+
+        async function ensureAnimationsLoaded() {
+            if (animationsLoaded && animationsByName) return;
+            try {
+                const data = await fetchJson("animation.json");
+                const indexFrames = Object.create(null);
+                const indexLoop = Object.create(null);
+                if (Array.isArray(data)) {
+                    data.forEach(entry => {
+                        if (!entry || typeof entry.name !== "string" || !Array.isArray(entry.frames)) return;
+                        const key = String(entry.name).toLowerCase();
+                        indexFrames[key] = normalizeFrames(entry.frames);
+                        if (Object.prototype.hasOwnProperty.call(entry, "loop")) {
+                            indexLoop[key] = !!entry.loop;
+                        }
+                    });
+                }
+                animationsByName = indexFrames;
+                animationLoopByName = indexLoop;
+                animationsLoaded = true;
+            } catch (e) {
+                // Keep empty index; per-file JSON fallback may still work
+                animationsByName = Object.create(null);
+                animationLoopByName = Object.create(null);
+                animationsLoaded = true;
+            }
+        }
+
+        async function loadAnimation(name) {
+            // Apply to both players, avoid duplicate timer stops/starts
+            try {
+                setStatus("Loading " + name + "…");
+                playing = true;
+                currentAnim = name;
+                stopTimer();
+                await Promise.all([
+                    loadAnimationFor(stateColor, name),
+                    loadAnimationFor(stateRed, name)
+                ]);
+                drawAll();
+                if (playing && !timer) startTimer();
+            } catch (err) {
+                console.error(err);
+                setStatus("Failed to load animation: " + (err && err.message ? err.message : String(err)));
+            }
+        }
+
+        async function loadAnimationFor(state, name) {
+            try {
+                state.frameIndex = 0;
+                state.frames = [];
+                state.spriteImage = null;
+                state.ctx.clearRect(0, 0, state.canvas.width, state.canvas.height);
+
+                // Load frames from animation.json (indexed once), fallback to per-file JSON
+                await ensureAnimationsLoaded();
+                const key = String(name).toLowerCase();
+                let rects = (animationsByName && animationsByName[key]) || [];
+                if (!rects.length) {
+                    // Fallback to legacy per-animation JSON if present
+                    try {
+                        const framesData = await fetchJson(`${name}.json`);
+                        rects = normalizeFrames(framesData);
+                    } catch {
+                        rects = [];
+                    }
+                }
+                if (!rects.length) {
+                    setStatus(`No frames found for "${name}" in animation.json or ${name}.json`);
+                    return;
+                }
+                state.frames = rects;
+
+                // Apply loop default from animation.json if provided
+                const hasLoopDefault =
+                    animationLoopByName &&
+                    Object.prototype.hasOwnProperty.call(animationLoopByName, key);
+                if (hasLoopDefault) {
+                    state.loopEnabled = !!animationLoopByName[key];
+                    // reflect in UI without triggering events
+                    // loopCheckbox removed; UI reflects JSON defaults implicitly
+                }
+
+                // Determine image candidates
+                const imgCandidates = guessImageCandidates(name);
+                const img = await loadFirstAvailableImage(imgCandidates);
+                if (!img) {
+                    setStatus("Could not find sprite image for " + name + ". Tried: " + imgCandidates.join(", "));
+                    return;
+                }
+                state.spriteImage = img;
+
+                // Set a stable canvas size (max frame size) with scale
+                updateCanvasSize(state);
+
+                // draw will be handled by caller (loadAnimation) to avoid duplicate work
+            } catch (err) {
+                console.error(err);
+                setStatus("Failed to load animation: " + (err && err.message ? err.message : String(err)));
+            }
+        }
+
+        function capitalize(s) {
+            return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+        }
+
+        async function fetchJson(url) {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+            return await res.json();
+        }
+
+        function normalizeFrames(data) {
+            if (!Array.isArray(data)) return [];
+            return data
+                .map(item => {
+                    const hasRect = item && typeof item.x === 'number' && typeof item.y === 'number' && typeof item.width === 'number' && typeof item.height === 'number';
+                    if (!hasRect) return null;
+                    if (!(item.width > 0 && item.height > 0)) return null;
+                    return { x: Math.round(item.x), y: Math.round(item.y), width: Math.round(item.width), height: Math.round(item.height) };
+                })
+                .filter(Boolean);
+        }
+
+        function guessImageCandidates(name) {
+            // Try typical variants inside assets/
+            const base = name.toLowerCase();
+            const variants = new Set();
+            // lower/capitalized
+            variants.add(`assets/${base}.png`);
+            variants.add(`assets/${capitalize(base)}.png`);
+            // common alternates
+            if (base === "jump") {
+                variants.add("assets/jumping.png");
+                variants.add("assets/Jumping.png");
+            }
+            return Array.from(variants);
+        }
+
+        function loadFirstAvailableImage(candidates) {
+            return new Promise(async (resolve) => {
+                for (const src of candidates) {
+                    try {
+                        const img = await loadImage(src);
+                        return resolve(img);
+                    } catch {
+                        // try next
+                    }
+                }
+                resolve(null);
+            });
+        }
+
+        function loadImage(src) {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.onload = () => resolve(img);
+                img.onerror = () => reject(new Error("Failed to load image: " + src));
+                img.src = src;
+            });
+        }
+
+        function drawAll() {
+            drawPlayer(stateColor);
+            drawPlayer(stateRed);
+        }
+
+        function drawPlayer(state) {
+            if (!state.spriteImage || !state.frames.length) return;
+            const f = state.frames[state.frameIndex % state.frames.length];
+            state.ctx.clearRect(0, 0, state.canvas.width, state.canvas.height);
+            state.ctx.save();
+            const dw = Math.max(1, Math.round(f.width * state.scale));
+            const dh = Math.max(1, Math.round(f.height * state.scale));
+            if (state.flip === "left") {
+                state.ctx.translate(dw, 0);
+                state.ctx.scale(-1, 1);
+            }
+            if (state.type === "color") {
+                state.ctx.drawImage(
+                    state.spriteImage,
+                    f.x, f.y, f.width, f.height,
+                    0, 0, dw, dh
+                );
+            } else {
+                // red-tinted path
+                // draw base
+                state.ctx.drawImage(
+                    state.spriteImage,
+                    f.x, f.y, f.width, f.height,
+                    0, 0, dw, dh
+                );
+                // multiply red
+                state.ctx.globalCompositeOperation = "multiply";
+                state.ctx.fillStyle = "#ff0000";
+                state.ctx.fillRect(0, 0, dw, dh);
+                // mask alpha
+                state.ctx.globalCompositeOperation = "destination-in";
+                state.ctx.drawImage(
+                    state.spriteImage,
+                    f.x, f.y, f.width, f.height,
+                    0, 0, dw, dh
+                );
+                // overlay on top
+                state.ctx.globalCompositeOperation = "source-atop";
+                state.ctx.globalAlpha = 0.25;
+                state.ctx.fillStyle = "#ff0000";
+                state.ctx.fillRect(0, 0, dw, dh);
+                state.ctx.globalAlpha = 1.0;
+                state.ctx.globalCompositeOperation = "source-over";
+            }
+            state.ctx.restore();
+        }
+
+        function stepPlayer(state) {
+            if (!state.frames.length) return;
+            if (state.loopEnabled) {
+                state.frameIndex = (state.frameIndex + 1) % state.frames.length;
+            } else {
+                if (state.frameIndex + 1 < state.frames.length) {
+                    state.frameIndex += 1;
+                }
+            }
+        }
+
+        function buildCharacterButtons() {
+            const order = ["idle", "run", "jump", "attack", "death"];
+            const available = animationsByName ? Object.keys(animationsByName) : [];
+            // preferred first, then the rest
+            const merged = [...order.filter(n => available.includes(n)), ...available.filter(n => !order.includes(n))];
+            const unique = Array.from(new Set(merged));
+            const animNames = unique.slice(0, 5); // first 5 are animations
+
+            function makeButtons(container, state) {
+                container.innerHTML = "";
+                const baseBtnClass = "bg-[#20283a] border border-[#3c7bff] text-[#f2f6ff] px-3 py-2 rounded-lg text-sm cursor-pointer disabled:opacity-50 disabled:cursor-default";
+                // 1-5: animation buttons
+                for (let i = 0; i < 5; i++) {
+                    const name = animNames[i];
+                    const btn = document.createElement("button");
+                    btn.className = baseBtnClass;
+                    if (name) {
+                        btn.textContent = capitalize(name);
+                        btn.addEventListener("click", () => loadAnimationFor(state, name));
+                    } else {
+                        btn.textContent = "—";
+                        btn.disabled = true;
+                    }
+                    container.appendChild(btn);
+                }
+                // 6: flip left
+                const flipLeftBtn = document.createElement("button");
+                flipLeftBtn.className = baseBtnClass;
+                flipLeftBtn.textContent = state.type === "color" ? "Left" : "Left";
+                flipLeftBtn.addEventListener("click", () => { state.flip = "left"; drawAll(); });
+                container.appendChild(flipLeftBtn);
+                // 7: flip right
+                const flipRightBtn = document.createElement("button");
+                flipRightBtn.className = baseBtnClass;
+                flipRightBtn.textContent = state.type === "color" ? "Right" : "Right";
+                flipRightBtn.addEventListener("click", () => { state.flip = "right"; drawAll(); });
+                container.appendChild(flipRightBtn);
+            }
+
+            makeButtons(p1Buttons, stateColor);
+            makeButtons(p2Buttons, stateRed);
+        }
+
+        // Load animations index and build per-character buttons, then auto-load idle for both
+        (async () => {
+            await ensureAnimationsLoaded();
+            buildCharacterButtons();
+            await loadAnimation("idle");
+        })().catch(() => setStatus("Choose an animation."));
+
+        // Scale controls
+        function wireScaleControls() {
+            function applyScale(state, inputEl, valueEl) {
+                const percent = clampInt(inputEl.value, 60, 200, 60);
+                inputEl.value = String(percent);
+                valueEl.textContent = percent + "%";
+                state.scale = percent / 100;
+                updateCanvasSize(state);
+                drawAll();
+            }
+            if (p1ScaleInput && p1ScaleVal) {
+                p1ScaleInput.addEventListener("input", () => applyScale(stateColor, p1ScaleInput, p1ScaleVal));
+            }
+            if (p2ScaleInput && p2ScaleVal) {
+                p2ScaleInput.addEventListener("input", () => applyScale(stateRed, p2ScaleInput, p2ScaleVal));
+            }
+        }
+        wireScaleControls();
+    </script>
+</body>
+
+</html>
